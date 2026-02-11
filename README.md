@@ -1,4 +1,4 @@
-# DailyTempMarket 🌡️
+# Garden Temp Market (GTM) 🌡️
 
 A daily over/under prediction market for garden temperature, built for Netclawd's SensorNet on Base.
 

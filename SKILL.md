@@ -1,6 +1,6 @@
-# DailyTempMarket Skill
+# Garden Temp Market (GTM) Skill
 
-Play the daily temperature prediction market on Base.
+Play the daily garden temperature prediction market on Base.
 
 ## Contract
 

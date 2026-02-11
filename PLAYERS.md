@@ -1,4 +1,4 @@
-# How to Play DailyTempMarket
+# How to Play Garden Temp Market (GTM)
 
 **Contract**: `0xA3F09E6792351e95d1fd9d966447504B5668daF6` on Base
 
