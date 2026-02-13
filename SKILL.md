@@ -4,7 +4,7 @@ Play the daily garden temperature prediction market on Base.
 
 ## Contract
 
-**Address**: `0xA3F09E6792351e95d1fd9d966447504B5668daF6`
+**Address**: `TBD` (v2 — pending redeployment)
 **Chain**: Base (chainId 8453)
 **RPC**: `https://mainnet.base.org`
 
@@ -14,15 +14,17 @@ Bet on whether today's 18:00 UTC garden temperature will be HIGHER or LOWER than
 
 - **HIGHER**: Bet that today > yesterday
 - **LOWER**: Bet that today <= yesterday
+- Winners call `claim()` to collect winnings (they pay gas)
 - Winners split 98% of the pot proportionally
 - Ties roll over, one-sided markets refund
+- Multiple bets allowed (same side or both sides)
 
 ## Reading Market State
 
 ### Get Full Market State
 
 ```bash
-cast call 0xA3F09E6792351e95d1fd9d966447504B5668daF6 \
+cast call $GTM_ADDRESS \
   "getMarketState()(uint256,int256,uint256,uint256,uint256,bool,uint256,uint256)" \
   --rpc-url https://mainnet.base.org
 ```
@@ -41,20 +43,27 @@ Returns (in order):
 
 ```bash
 # Yesterday's baseline (divide by 100 for °C)
-cast call 0xA3F09E6792351e95d1fd9d966447504B5668daF6 "yesterdayTemp()(int256)" --rpc-url https://mainnet.base.org
+cast call $GTM_ADDRESS "yesterdayTemp()(int256)" --rpc-url https://mainnet.base.org
 
 # Is betting open?
-cast call 0xA3F09E6792351e95d1fd9d966447504B5668daF6 "bettingOpen()(bool)" --rpc-url https://mainnet.base.org
+cast call $GTM_ADDRESS "bettingOpen()(bool)" --rpc-url https://mainnet.base.org
 
 # Pool sizes (wei)
-cast call 0xA3F09E6792351e95d1fd9d966447504B5668daF6 "higherPool()(uint256)" --rpc-url https://mainnet.base.org
-cast call 0xA3F09E6792351e95d1fd9d966447504B5668daF6 "lowerPool()(uint256)" --rpc-url https://mainnet.base.org
+cast call $GTM_ADDRESS "higherPool()(uint256)" --rpc-url https://mainnet.base.org
+cast call $GTM_ADDRESS "lowerPool()(uint256)" --rpc-url https://mainnet.base.org
 
 # Check my bet (returns higherAmt, lowerAmt in wei)
-cast call 0xA3F09E6792351e95d1fd9d966447504B5668daF6 "getMyBet(address)(uint256,uint256)" YOUR_ADDRESS --rpc-url https://mainnet.base.org
+cast call $GTM_ADDRESS "getMyBet(address)(uint256,uint256)" YOUR_ADDRESS --rpc-url https://mainnet.base.org
 
-# Minimum bet (wei)
-cast call 0xA3F09E6792351e95d1fd9d966447504B5668daF6 "minBet()(uint256)" --rpc-url https://mainnet.base.org
+# Check claimable winnings for a round
+cast call $GTM_ADDRESS "claimable(uint256,address)(uint256)" ROUND_NUMBER YOUR_ADDRESS --rpc-url https://mainnet.base.org
+
+# Min/max bet (wei)
+cast call $GTM_ADDRESS "minBet()(uint256)" --rpc-url https://mainnet.base.org
+cast call $GTM_ADDRESS "maxBet()(uint256)" --rpc-url https://mainnet.base.org
+
+# Safe mode on?
+cast call $GTM_ADDRESS "safeMode()(bool)" --rpc-url https://mainnet.base.org
 ```
 
 ## Placing Bets
@@ -63,27 +72,57 @@ cast call 0xA3F09E6792351e95d1fd9d966447504B5668daF6 "minBet()(uint256)" --rpc-u
 
 | Function | Selector |
 |----------|----------|
-| `betHigher()` | `0xb8b2e5f7` |
-| `betLower()` | `0x7a5ce755` |
+| `betHigher()` | `0xb3dd0f5a` |
+| `betLower()` | `0x771a2ab3` |
+| `claim(uint256)` | `0x379607f5` |
+| `claimable(uint256,address)` | `0xa0c7f71c` |
+
+### Using Bankr (Natural Language)
+
+```
+Bet 0.001 ETH higher on the garden temp market
+```
+
+```
+Bet 0.001 ETH lower on the garden temp market
+```
+
+```
+Claim my winnings from GTM round 1
+```
+
+```
+Check if I have claimable winnings on the garden temp market
+```
 
 ### Using Bankr Direct API
 
-**Bet HIGHER with 0.01 ETH:**
+**Bet HIGHER with 0.001 ETH:**
 ```json
 {
-  "to": "0xA3F09E6792351e95d1fd9d966447504B5668daF6",
-  "data": "0xb8b2e5f7",
-  "value": "10000000000000000",
+  "to": "GTM_ADDRESS",
+  "data": "0xb3dd0f5a",
+  "value": "1000000000000000",
   "chainId": 8453
 }
 ```
 
-**Bet LOWER with 0.01 ETH:**
+**Bet LOWER with 0.001 ETH:**
 ```json
 {
-  "to": "0xA3F09E6792351e95d1fd9d966447504B5668daF6",
-  "data": "0x7a5ce755",
-  "value": "10000000000000000",
+  "to": "GTM_ADDRESS",
+  "data": "0x771a2ab3",
+  "value": "1000000000000000",
+  "chainId": 8453
+}
+```
+
+**Claim winnings from round 1:**
+```json
+{
+  "to": "GTM_ADDRESS",
+  "data": "0x379607f50000000000000000000000000000000000000000000000000000000000000001",
+  "value": "0",
   "chainId": 8453
 }
 ```
@@ -91,19 +130,23 @@ cast call 0xA3F09E6792351e95d1fd9d966447504B5668daF6 "minBet()(uint256)" --rpc-u
 Submit via Bankr:
 ```
 Submit this transaction:
-{"to":"0xA3F09E6792351e95d1fd9d966447504B5668daF6","data":"0xb8b2e5f7","value":"10000000000000000","chainId":8453}
+{"to":"GTM_ADDRESS","data":"0xb3dd0f5a","value":"1000000000000000","chainId":8453}
 ```
 
 ### Using cast
 
 ```bash
 # Bet HIGHER
-cast send 0xA3F09E6792351e95d1fd9d966447504B5668daF6 "betHigher()" \
-  --value 0.01ether --rpc-url https://mainnet.base.org --private-key $KEY
+cast send $GTM_ADDRESS "betHigher()" \
+  --value 0.001ether --rpc-url https://mainnet.base.org --private-key $KEY
 
 # Bet LOWER
-cast send 0xA3F09E6792351e95d1fd9d966447504B5668daF6 "betLower()" \
-  --value 0.01ether --rpc-url https://mainnet.base.org --private-key $KEY
+cast send $GTM_ADDRESS "betLower()" \
+  --value 0.001ether --rpc-url https://mainnet.base.org --private-key $KEY
+
+# Claim winnings from round 1
+cast send $GTM_ADDRESS "claim(uint256)" 1 \
+  --rpc-url https://mainnet.base.org --private-key $KEY
 ```
 
 ## Value Conversions
@@ -111,12 +154,14 @@ cast send 0xA3F09E6792351e95d1fd9d966447504B5668daF6 "betLower()" \
 | ETH | Wei |
 |-----|-----|
 | 0.001 | 1000000000000000 |
+| 0.002 | 2000000000000000 |
 | 0.005 | 5000000000000000 |
 | 0.01 | 10000000000000000 |
 | 0.05 | 50000000000000000 |
 | 0.1 | 100000000000000000 |
 
-**Minimum bet**: 0.001 ETH = 1000000000000000 wei
+**Minimum bet**: 0.001 ETH
+**Maximum bet (safe mode)**: 0.002 ETH (~$5) during testing. 0 = no limit when safe mode is off.
 
 ## Schedule
 
@@ -124,15 +169,26 @@ cast send 0xA3F09E6792351e95d1fd9d966447504B5668daF6 "betLower()" \
 |------------|-------|
 | After settlement | Betting opens |
 | 12:00 | Betting closes |
-| 18:00 | Settlement + payouts |
+| 18:00 | Settlement (keeper records result) |
+| Anytime after | Winners claim via `claim(round)` |
 
 ## Rules
 
-- One bet per address per round (HIGHER or LOWER, not both)
+- Multiple bets allowed per address per round
+- Can bet on both HIGHER and LOWER in the same round
 - No bet cancellations
-- Maximum 200 bettors per side
-- Ties: pot rolls to next day
-- One-sided: everyone refunded
+- Winners must call `claim(round)` to collect (pull-based payouts)
+- Ties: pot rolls to next day, nothing to claim
+- One-sided: everyone claims a refund
+- Safe mode: max bet capped at ~$5 during testing
+
+## Claim Flow
+
+After a round settles:
+
+1. **Check if you won**: `claimable(roundNumber, yourAddress)` — returns wei amount
+2. **Claim**: `claim(roundNumber)` — sends your winnings
+3. **Can't double-claim**: Contract tracks who already claimed
 
 ## Example Agent Strategy
 
@@ -169,8 +225,13 @@ if side == "HIGHER" and higher_pool > lower_pool * 2:
     print("Pool is lopsided, might skip or bet small")
 
 # 6. Place bet
-amount = 0.01  # ETH
+amount = 0.001  # ETH (check maxBet first!)
 submit_bet(side, amount)
+
+# 7. After settlement, claim winnings
+claimable_amount = call("claimable(round, my_address)")
+if claimable_amount > 0:
+    submit_claim(round)
 ```
 
 ## Events to Monitor
@@ -190,7 +251,7 @@ The temperature comes from Netclawd's SensorNet:
 
 ## Links
 
-- Basescan: https://basescan.org/address/0xA3F09E6792351e95d1fd9d966447504B5668daF6
-- Source: https://github.com/Potdealer/prediction-market (if published)
+- Source: https://github.com/Potdealer/prediction-market
+- ClawhHub: `prediction-market` skill
 
 Built by **potdealer x Ollie** for **Netclawd**

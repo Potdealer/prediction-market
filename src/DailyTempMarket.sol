@@ -25,8 +25,10 @@ pragma solidity ^0.8.20;
  * - Betting opens after previous settlement
  * - Betting closes 6 hours before settlement (12:00 UTC)
  * - Keeper reads temp from Net Protocol at 18:00 UTC
- * - Winners split 98% of NEW bets, 2% to house (rollover is fee-free)
- * - Ties roll over, one-sided markets refund
+ * - Keeper calls settle() — records result, no payouts in settle
+ * - Winners call claim() to pull their winnings (they pay gas)
+ * - 98% to winners, 2% to house (rollover is fee-free)
+ * - Ties roll over, one-sided markets auto-refund via claim
  * - Yesterday's reading auto-updates, cycle repeats
  *
  * Temperature format: int256 with 2 decimal places (e.g., 1210 = 12.10°C)
@@ -46,8 +48,10 @@ contract DailyTempMarket {
     ISensorNet public sensorNet;
 
     bool public paused;
+    bool public safeMode;             // Limits max bet for testing
     bool private _locked;             // Reentrancy guard
     uint256 public minBet;            // Minimum bet amount (changeable)
+    uint256 public maxBet;            // Maximum bet (0 = no limit, >0 when safeMode)
 
     int256 public yesterdayTemp;      // Previous day's reading
     uint256 public lastSettlement;    // Timestamp of last settlement
@@ -59,8 +63,19 @@ contract DailyTempMarket {
 
     mapping(uint256 => mapping(address => uint256)) public higherBets;
     mapping(uint256 => mapping(address => uint256)) public lowerBets;
-    mapping(uint256 => address[]) public higherBettors;
-    mapping(uint256 => address[]) public lowerBettors;
+    mapping(uint256 => mapping(address => bool)) public claimed;
+
+    // Round results — stored after settle() so claim() can calculate payouts
+    struct RoundResult {
+        bool settled;
+        bool wasTie;
+        bool higherWon;
+        bool oneSided;       // true if only one side had bets (refund)
+        uint256 higherPool;
+        uint256 lowerPool;
+        uint256 winnerPayout; // total pool available to winners (after house fee)
+    }
+    mapping(uint256 => RoundResult) public roundResults;
 
     // ============ Constants ============
 
@@ -68,7 +83,7 @@ contract DailyTempMarket {
     uint256 public constant SETTLEMENT_INTERVAL = 24 hours;
     uint256 public constant HOUSE_FEE_BPS = 200;  // 2% = 200 basis points
     uint256 public constant BPS_DENOMINATOR = 10000;
-    uint256 public constant MAX_BETTORS_PER_SIDE = 200;  // Gas DoS protection
+    uint256 public constant CLAIM_WINDOW = 30 days;  // Time to claim after settlement
     int256 public constant MIN_TEMP = -5000;  // -50.00°C
     int256 public constant MAX_TEMP = 6000;   // 60.00°C
 
@@ -91,8 +106,6 @@ contract DailyTempMarket {
         uint256 houseFee
     );
     event WinningsClaimed(uint256 indexed round, address indexed bettor, uint256 amount);
-    event Refunded(uint256 indexed round, address indexed bettor, uint256 amount);
-    event PayoutFailed(uint256 indexed round, address indexed bettor, uint256 amount);
     event Paused(bool isPaused);
 
     // ============ Modifiers ============
@@ -142,22 +155,22 @@ contract DailyTempMarket {
         lastSettlement = block.timestamp;
         currentRound = 1;
         minBet = 0.001 ether;  // Default minimum bet
+        safeMode = true;                  // Start in safe mode
+        maxBet = 0.002 ether;             // ~$5 cap during testing
     }
 
     // ============ Betting ============
 
     /**
      * @notice Bet that today's temp will be HIGHER than yesterday's
+     * @dev Users can bet multiple times, and can bet on both sides
      */
     function betHigher() external payable notPaused {
         require(msg.value >= minBet, "Below minimum bet");
+        require(maxBet == 0 || msg.value <= maxBet, "Above maximum bet");
         require(bettingOpen(), "Betting closed");
-        require(higherBets[currentRound][msg.sender] == 0, "Already bet HIGHER");
-        require(lowerBets[currentRound][msg.sender] == 0, "Already bet LOWER");
-        require(higherBettors[currentRound].length < MAX_BETTORS_PER_SIDE, "Too many bettors");
 
-        higherBets[currentRound][msg.sender] = msg.value;
-        higherBettors[currentRound].push(msg.sender);
+        higherBets[currentRound][msg.sender] += msg.value;
         higherPool += msg.value;
 
         emit BetPlaced(currentRound, msg.sender, true, msg.value, yesterdayTemp);
@@ -165,16 +178,14 @@ contract DailyTempMarket {
 
     /**
      * @notice Bet that today's temp will be LOWER or equal to yesterday's
+     * @dev Users can bet multiple times, and can bet on both sides
      */
     function betLower() external payable notPaused {
         require(msg.value >= minBet, "Below minimum bet");
+        require(maxBet == 0 || msg.value <= maxBet, "Above maximum bet");
         require(bettingOpen(), "Betting closed");
-        require(lowerBets[currentRound][msg.sender] == 0, "Already bet LOWER");
-        require(higherBets[currentRound][msg.sender] == 0, "Already bet HIGHER");
-        require(lowerBettors[currentRound].length < MAX_BETTORS_PER_SIDE, "Too many bettors");
 
-        lowerBets[currentRound][msg.sender] = msg.value;
-        lowerBettors[currentRound].push(msg.sender);
+        lowerBets[currentRound][msg.sender] += msg.value;
         lowerPool += msg.value;
 
         emit BetPlaced(currentRound, msg.sender, false, msg.value, yesterdayTemp);
@@ -213,7 +224,7 @@ contract DailyTempMarket {
 
     /**
      * @notice Settle the current round — called by keeper at 18:00 UTC daily
-     * @dev Keeper reads temperature from Net Protocol off-chain and passes it here.
+     * @dev Records result only — no payouts. Winners call claim() to withdraw.
      *      THE KEEPER IS FULLY TRUSTED to provide the correct temperature.
      * @param todayTemp Today's temperature reading (2 decimal places)
      */
@@ -226,37 +237,42 @@ contract DailyTempMarket {
         uint256 totalPool = newBets + rolloverPool;
         bool wasTie = (todayTemp == yesterdayTemp);
         bool higherWon = (todayTemp > yesterdayTemp);
+        bool oneSided = (higherPool == 0 || lowerPool == 0);
 
         uint256 houseFee = 0;
+        uint256 winnerPayout = 0;
 
         if (totalPool == 0) {
             // No bets — just advance
-        } else if (higherPool == 0 || lowerPool == 0) {
-            // One-sided market — refund everyone
-            _refundAll();
-            // Rollover stays intact for next round
+        } else if (oneSided) {
+            // One-sided market — bettors claim refunds via claim()
+            winnerPayout = totalPool - rolloverPool; // just the bets, rollover stays
         } else if (wasTie) {
             // Tie — roll over entire pot
             rolloverPool = totalPool;
         } else {
             // We have winners — take house fee on NEW BETS ONLY (not rollover)
             houseFee = (newBets * HOUSE_FEE_BPS) / BPS_DENOMINATOR;
-            uint256 winnerPool = totalPool - houseFee;
+            winnerPayout = totalPool - houseFee;
+            rolloverPool = 0;
 
             // Send house fee to treasury
             if (houseFee > 0) {
                 (bool feeSuccess, ) = treasury.call{value: houseFee}("");
                 require(feeSuccess, "Fee transfer failed");
             }
-
-            // Distribute to winners
-            rolloverPool = 0;
-            if (higherWon) {
-                _distributeWinnings(true, winnerPool);
-            } else {
-                _distributeWinnings(false, winnerPool);
-            }
         }
+
+        // Store round result for claim()
+        roundResults[currentRound] = RoundResult({
+            settled: true,
+            wasTie: wasTie,
+            higherWon: higherWon,
+            oneSided: oneSided,
+            higherPool: higherPool,
+            lowerPool: lowerPool,
+            winnerPayout: winnerPayout
+        });
 
         emit RoundSettled(
             currentRound,
@@ -276,55 +292,73 @@ contract DailyTempMarket {
         currentRound++;
     }
 
-    function _distributeWinnings(bool higherWon, uint256 totalPayout) internal {
-        address[] storage winners = higherWon
-            ? higherBettors[currentRound]
-            : lowerBettors[currentRound];
-        uint256 winningPool = higherWon ? higherPool : lowerPool;
+    // ============ Claim ============
 
-        for (uint256 i = 0; i < winners.length; i++) {
-            address winner = winners[i];
-            uint256 bet = higherWon
-                ? higherBets[currentRound][winner]
-                : lowerBets[currentRound][winner];
+    /**
+     * @notice Claim winnings (or refund) for a settled round
+     * @param round The round number to claim for
+     */
+    function claim(uint256 round) external nonReentrant {
+        RoundResult storage result = roundResults[round];
+        require(result.settled, "Round not settled");
+        require(!claimed[round][msg.sender], "Already claimed");
 
-            uint256 payout = (bet * totalPayout) / winningPool;
+        uint256 payout = 0;
 
-            (bool success, ) = winner.call{value: payout}("");
-            if (success) {
-                emit WinningsClaimed(currentRound, winner, payout);
+        if (result.oneSided) {
+            // Refund — return whatever they bet on either side
+            payout = higherBets[round][msg.sender] + lowerBets[round][msg.sender];
+        } else if (!result.wasTie) {
+            // Normal win — proportional share of winnerPayout
+            uint256 winningBet;
+            uint256 winningPool;
+            if (result.higherWon) {
+                winningBet = higherBets[round][msg.sender];
+                winningPool = result.higherPool;
             } else {
-                emit PayoutFailed(currentRound, winner, payout);
+                winningBet = lowerBets[round][msg.sender];
+                winningPool = result.lowerPool;
+            }
+            if (winningBet > 0 && winningPool > 0) {
+                payout = (winningBet * result.winnerPayout) / winningPool;
             }
         }
+        // Ties: nothing to claim (rolled over)
+
+        require(payout > 0, "Nothing to claim");
+
+        claimed[round][msg.sender] = true;
+
+        (bool success, ) = msg.sender.call{value: payout}("");
+        require(success, "Transfer failed");
+
+        emit WinningsClaimed(round, msg.sender, payout);
     }
 
-    function _refundAll() internal {
-        for (uint256 i = 0; i < higherBettors[currentRound].length; i++) {
-            address bettor = higherBettors[currentRound][i];
-            uint256 amount = higherBets[currentRound][bettor];
-            if (amount > 0) {
-                (bool success, ) = bettor.call{value: amount}("");
-                if (success) {
-                    emit Refunded(currentRound, bettor, amount);
-                } else {
-                    emit PayoutFailed(currentRound, bettor, amount);
-                }
-            }
-        }
+    /**
+     * @notice Check how much a user can claim for a given round
+     */
+    function claimable(uint256 round, address user) external view returns (uint256) {
+        RoundResult storage result = roundResults[round];
+        if (!result.settled || claimed[round][user]) return 0;
 
-        for (uint256 i = 0; i < lowerBettors[currentRound].length; i++) {
-            address bettor = lowerBettors[currentRound][i];
-            uint256 amount = lowerBets[currentRound][bettor];
-            if (amount > 0) {
-                (bool success, ) = bettor.call{value: amount}("");
-                if (success) {
-                    emit Refunded(currentRound, bettor, amount);
-                } else {
-                    emit PayoutFailed(currentRound, bettor, amount);
-                }
+        if (result.oneSided) {
+            return higherBets[round][user] + lowerBets[round][user];
+        } else if (!result.wasTie) {
+            uint256 winningBet;
+            uint256 winningPool;
+            if (result.higherWon) {
+                winningBet = higherBets[round][user];
+                winningPool = result.higherPool;
+            } else {
+                winningBet = lowerBets[round][user];
+                winningPool = result.lowerPool;
+            }
+            if (winningBet > 0 && winningPool > 0) {
+                return (winningBet * result.winnerPayout) / winningPool;
             }
         }
+        return 0;
     }
 
     // ============ Views ============
@@ -364,13 +398,6 @@ contract DailyTempMarket {
         return (higherBets[currentRound][user], lowerBets[currentRound][user]);
     }
 
-    /**
-     * @notice Get bet counts for current round
-     */
-    function getBetCounts() external view returns (uint256 higherCount, uint256 lowerCount) {
-        return (higherBettors[currentRound].length, lowerBettors[currentRound].length);
-    }
-
     // ============ Admin ============
 
     function pause() external onlyOwner {
@@ -397,6 +424,15 @@ contract DailyTempMarket {
 
     function setMinBet(uint256 _minBet) external onlyOwner {
         minBet = _minBet;
+    }
+
+    function setMaxBet(uint256 _maxBet) external onlyOwner {
+        maxBet = _maxBet;
+    }
+
+    function setSafeMode(bool _safeMode, uint256 _maxBet) external onlyOwner {
+        safeMode = _safeMode;
+        maxBet = _safeMode ? _maxBet : 0;
     }
 
     function transferOwnership(address newOwner) external onlyOwner {

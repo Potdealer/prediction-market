@@ -27,6 +27,9 @@ contract DailyTempMarketTest is Test {
             INITIAL_TEMP
         );
 
+        // Disable safe mode for tests (allows large bets)
+        market.setSafeMode(false, 0);
+
         // Fund test accounts
         vm.deal(alice, 10 ether);
         vm.deal(bob, 10 ether);
@@ -89,10 +92,6 @@ contract DailyTempMarketTest is Test {
 
         assertEq(market.higherPool(), 1.5 ether);
         assertEq(market.lowerPool(), 2 ether);
-
-        (uint256 higherCount, uint256 lowerCount) = market.getBetCounts();
-        assertEq(higherCount, 2);
-        assertEq(lowerCount, 1);
     }
 
     function test_RevertOnBelowMinBet() public {
@@ -122,118 +121,103 @@ contract DailyTempMarketTest is Test {
         assertEq(market.higherPool(), 0.01 ether);
     }
 
-    function test_RevertOnDoubleBetSameSide() public {
+    function test_MultipleBetsSameSide() public {
         vm.prank(alice);
         market.betHigher{value: 1 ether}();
 
         vm.prank(alice);
-        vm.expectRevert("Already bet HIGHER");
-        market.betHigher{value: 1 ether}();
+        market.betHigher{value: 0.5 ether}();
+
+        (uint256 higher, ) = market.getMyBet(alice);
+        assertEq(higher, 1.5 ether);
+        assertEq(market.higherPool(), 1.5 ether);
     }
 
-    function test_RevertOnBetBothSides() public {
+    function test_BetBothSides() public {
         vm.prank(alice);
         market.betHigher{value: 1 ether}();
 
         vm.prank(alice);
-        vm.expectRevert("Already bet HIGHER");
-        market.betLower{value: 1 ether}();
-    }
+        market.betLower{value: 0.5 ether}();
 
-    function test_RevertOnTooManyBettors() public {
-        // Fill up HIGHER side to max
-        for (uint256 i = 0; i < 200; i++) {
-            address bettor = address(uint160(0x10000 + i));
-            vm.deal(bettor, 1 ether);
-            vm.prank(bettor);
-            market.betHigher{value: 0.001 ether}();
-        }
-
-        // 201st bettor should fail
-        address extraBettor = address(0x99999);
-        vm.deal(extraBettor, 1 ether);
-        vm.prank(extraBettor);
-        vm.expectRevert("Too many bettors");
-        market.betHigher{value: 0.001 ether}();
+        (uint256 higher, uint256 lower) = market.getMyBet(alice);
+        assertEq(higher, 1 ether);
+        assertEq(lower, 0.5 ether);
     }
 
     // ============ Settlement Tests ============
 
     function test_SettlementHigherWins() public {
-        // Alice bets HIGHER, Bob bets LOWER
         vm.prank(alice);
         market.betHigher{value: 1 ether}();
-
         vm.prank(bob);
         market.betLower{value: 1 ether}();
 
-        // Total pot = 2 ETH, house takes 2% = 0.04 ETH, winners get 1.96 ETH
-
-        // Fast forward past betting deadline
         vm.warp(block.timestamp + 24 hours);
 
-        // Temperature goes up — HIGHER wins
         int256 todayTemp = 1450; // 14.50°C > 12.10°C
 
-        uint256 aliceBalanceBefore = alice.balance;
         uint256 treasuryBalanceBefore = treasury.balance;
 
         vm.prank(keeper);
         market.settle(todayTemp);
 
-        // Alice should get 98% of 2 ETH = 1.96 ETH
-        assertEq(alice.balance - aliceBalanceBefore, 1.96 ether);
-        // Treasury gets 2% = 0.04 ETH
+        // Treasury gets 2% of 2 ETH = 0.04 ETH
         assertEq(treasury.balance - treasuryBalanceBefore, 0.04 ether);
-        // Bob gets nothing (loser)
         assertEq(market.currentRound(), 2);
         assertEq(market.yesterdayTemp(), 1450);
+
+        // Alice claims 1.96 ETH
+        uint256 aliceBalanceBefore = alice.balance;
+        vm.prank(alice);
+        market.claim(1);
+        assertEq(alice.balance - aliceBalanceBefore, 1.96 ether);
+
+        // Bob has nothing to claim
+        vm.prank(bob);
+        vm.expectRevert("Nothing to claim");
+        market.claim(1);
     }
 
     function test_SettlementLowerWins() public {
         vm.prank(alice);
         market.betHigher{value: 1 ether}();
-
         vm.prank(bob);
         market.betLower{value: 1 ether}();
 
         vm.warp(block.timestamp + 24 hours);
 
-        // Temperature goes down — LOWER wins
         int256 todayTemp = 1000; // 10.00°C < 12.10°C
-
-        uint256 bobBalanceBefore = bob.balance;
 
         vm.prank(keeper);
         market.settle(todayTemp);
 
-        // Bob wins
+        // Bob claims
+        uint256 bobBalanceBefore = bob.balance;
+        vm.prank(bob);
+        market.claim(1);
         assertEq(bob.balance - bobBalanceBefore, 1.96 ether);
     }
 
     function test_SettlementTieRollsOver() public {
         vm.prank(alice);
         market.betHigher{value: 1 ether}();
-
         vm.prank(bob);
         market.betLower{value: 1 ether}();
 
         vm.warp(block.timestamp + 24 hours);
 
-        // Temperature stays the same — TIE
-        uint256 aliceBalanceBefore = alice.balance;
-        uint256 bobBalanceBefore = bob.balance;
-
         vm.prank(keeper);
-        market.settle(INITIAL_TEMP);
-
-        // Nobody wins, balances unchanged
-        assertEq(alice.balance, aliceBalanceBefore);
-        assertEq(bob.balance, bobBalanceBefore);
+        market.settle(INITIAL_TEMP); // Tie
 
         // Pot rolls over
         assertEq(market.rolloverPool(), 2 ether);
         assertEq(market.currentRound(), 2);
+
+        // Nothing to claim on ties
+        vm.prank(alice);
+        vm.expectRevert("Nothing to claim");
+        market.claim(1);
     }
 
     function test_RolloverAddsToPot_NoDoubleFee() public {
@@ -258,18 +242,20 @@ contract DailyTempMarketTest is Test {
         vm.warp(block.timestamp + 24 hours);
         int256 todayTemp = 1500; // HIGHER wins
 
-        uint256 aliceBalanceBefore = alice.balance;
         uint256 treasuryBalanceBefore = treasury.balance;
 
         vm.prank(keeper);
         market.settle(todayTemp);
 
-        // Total pot = 2 ETH rollover + 1 ETH new = 3 ETH
         // House fee = 2% of NEW BETS ONLY (1 ETH) = 0.02 ETH
-        // Alice gets 3 ETH - 0.02 ETH = 2.98 ETH
-        assertEq(alice.balance - aliceBalanceBefore, 2.98 ether);
         assertEq(treasury.balance - treasuryBalanceBefore, 0.02 ether);
         assertEq(market.rolloverPool(), 0);
+
+        // Alice claims: 3 ETH - 0.02 ETH = 2.98 ETH
+        uint256 aliceBalanceBefore = alice.balance;
+        vm.prank(alice);
+        market.claim(2);
+        assertEq(alice.balance - aliceBalanceBefore, 2.98 ether);
     }
 
     function test_OneSidedMarketRefunds() public {
@@ -281,14 +267,18 @@ contract DailyTempMarketTest is Test {
 
         vm.warp(block.timestamp + 24 hours);
 
-        uint256 aliceBalanceBefore = alice.balance;
-        uint256 charlieBalanceBefore = charlie.balance;
-
         vm.prank(keeper);
         market.settle(1500);
 
-        // Everyone gets refunded
+        // Everyone claims refunds
+        uint256 aliceBalanceBefore = alice.balance;
+        vm.prank(alice);
+        market.claim(1);
         assertEq(alice.balance - aliceBalanceBefore, 1 ether);
+
+        uint256 charlieBalanceBefore = charlie.balance;
+        vm.prank(charlie);
+        market.claim(1);
         assertEq(charlie.balance - charlieBalanceBefore, 0.5 ether);
     }
 
@@ -316,6 +306,74 @@ contract DailyTempMarketTest is Test {
         vm.prank(keeper);
         vm.expectRevert("Temperature out of bounds");
         market.settle(-6000); // Below MIN_TEMP
+    }
+
+    // ============ Claim Tests ============
+
+    function test_ClaimableView() public {
+        vm.prank(alice);
+        market.betHigher{value: 1 ether}();
+        vm.prank(bob);
+        market.betLower{value: 1 ether}();
+
+        // Before settlement — nothing claimable
+        assertEq(market.claimable(1, alice), 0);
+
+        vm.warp(block.timestamp + 24 hours);
+        vm.prank(keeper);
+        market.settle(1500); // HIGHER wins
+
+        // Alice can claim, Bob can't
+        assertEq(market.claimable(1, alice), 1.96 ether);
+        assertEq(market.claimable(1, bob), 0);
+
+        // After claiming — nothing left
+        vm.prank(alice);
+        market.claim(1);
+        assertEq(market.claimable(1, alice), 0);
+    }
+
+    function test_RevertDoubleClaim() public {
+        vm.prank(alice);
+        market.betHigher{value: 1 ether}();
+        vm.prank(bob);
+        market.betLower{value: 1 ether}();
+
+        vm.warp(block.timestamp + 24 hours);
+        vm.prank(keeper);
+        market.settle(1500);
+
+        vm.prank(alice);
+        market.claim(1);
+
+        vm.prank(alice);
+        vm.expectRevert("Already claimed");
+        market.claim(1);
+    }
+
+    function test_RevertClaimUnsettledRound() public {
+        vm.prank(alice);
+        market.betHigher{value: 1 ether}();
+
+        vm.prank(alice);
+        vm.expectRevert("Round not settled");
+        market.claim(1);
+    }
+
+    function test_RevertClaimNoBet() public {
+        vm.prank(alice);
+        market.betHigher{value: 1 ether}();
+        vm.prank(bob);
+        market.betLower{value: 1 ether}();
+
+        vm.warp(block.timestamp + 24 hours);
+        vm.prank(keeper);
+        market.settle(1500);
+
+        // Charlie didn't bet
+        vm.prank(charlie);
+        vm.expectRevert("Nothing to claim");
+        market.claim(1);
     }
 
     // ============ Betting Window Tests ============
@@ -360,16 +418,20 @@ contract DailyTempMarketTest is Test {
 
         vm.warp(block.timestamp + 24 hours);
 
-        uint256 aliceBalanceBefore = alice.balance;
-        uint256 charlieBalanceBefore = charlie.balance;
-
         vm.prank(keeper);
         market.settle(1500); // HIGHER wins
 
         // Total pot = 8 ETH, house takes 2% of 8 ETH = 0.16 ETH, winners split 7.84 ETH
         // Alice: 3/4 of 7.84 = 5.88 ETH
-        // Charlie: 1/4 of 7.84 = 1.96 ETH
+        uint256 aliceBalanceBefore = alice.balance;
+        vm.prank(alice);
+        market.claim(1);
         assertEq(alice.balance - aliceBalanceBefore, 5.88 ether);
+
+        // Charlie: 1/4 of 7.84 = 1.96 ETH
+        uint256 charlieBalanceBefore = charlie.balance;
+        vm.prank(charlie);
+        market.claim(1);
         assertEq(charlie.balance - charlieBalanceBefore, 1.96 ether);
     }
 
@@ -418,7 +480,6 @@ contract DailyTempMarketTest is Test {
     }
 
     function test_Rescue() public {
-        // First need to get some ETH into the contract via betting
         vm.prank(alice);
         market.betHigher{value: 5 ether}();
 
@@ -426,7 +487,7 @@ contract DailyTempMarketTest is Test {
         vm.expectRevert("Must pause first");
         market.rescue(alice, 5 ether);
 
-        // Pause and rescue to alice (who can receive ETH)
+        // Pause and rescue
         market.pause();
         uint256 balanceBefore = bob.balance;
         market.rescue(bob, 5 ether);
@@ -444,7 +505,6 @@ contract DailyTempMarketTest is Test {
     function test_RevertOnDirectTransfer() public {
         vm.prank(alice);
         (bool success,) = address(market).call{value: 1 ether}("");
-        // The low-level call returns false when the contract reverts
         assertFalse(success);
     }
 
@@ -486,7 +546,6 @@ contract DailyTempMarketTest is Test {
         vm.prank(keeper);
         market.settle(1500);
 
-        // Should advance without reverting
         assertEq(market.currentRound(), 2);
     }
 
@@ -498,7 +557,6 @@ contract DailyTempMarketTest is Test {
 
         vm.warp(block.timestamp + 24 hours);
 
-        // Owner should be able to settle (not just keeper)
         market.settle(1500);
         assertEq(market.currentRound(), 2);
     }
@@ -517,6 +575,10 @@ contract DailyTempMarketTest is Test {
         assertEq(market.currentRound(), 2);
         assertEq(market.yesterdayTemp(), 1300);
 
+        // Claim round 1 (higher won: 1300 > 1210)
+        vm.prank(alice);
+        market.claim(1);
+
         // Round 2
         vm.prank(alice);
         market.betLower{value: 1 ether}();
@@ -529,15 +591,84 @@ contract DailyTempMarketTest is Test {
 
         assertEq(market.currentRound(), 3);
         assertEq(market.yesterdayTemp(), 1100);
+
+        // Alice wins round 2 (lower won)
+        vm.prank(alice);
+        market.claim(2);
+    }
+
+    function test_MultipleBetsThenClaim() public {
+        // Alice bets HIGHER multiple times
+        vm.prank(alice);
+        market.betHigher{value: 1 ether}();
+        vm.prank(alice);
+        market.betHigher{value: 0.5 ether}();
+
+        vm.prank(bob);
+        market.betLower{value: 1.5 ether}();
+
+        vm.warp(block.timestamp + 24 hours);
+        vm.prank(keeper);
+        market.settle(1500); // HIGHER wins
+
+        // Alice's total bet = 1.5 ETH, total pool = 3 ETH
+        // House fee = 2% of 3 = 0.06, winners get 2.94
+        // Alice gets all of 2.94 (only higher bettor)
+        uint256 aliceBalanceBefore = alice.balance;
+        vm.prank(alice);
+        market.claim(1);
+        assertEq(alice.balance - aliceBalanceBefore, 2.94 ether);
+    }
+
+    // ============ Safe Mode Tests ============
+
+    function test_SafeModeDefaultsOn() public {
+        // Deploy a fresh contract — safe mode should be on by default
+        DailyTempMarket fresh = new DailyTempMarket(
+            address(sensorNet), keeper, treasury, INITIAL_TEMP
+        );
+        assertTrue(fresh.safeMode());
+        assertEq(fresh.maxBet(), 0.002 ether);
+    }
+
+    function test_SafeModeBlocksLargeBets() public {
+        market.setSafeMode(true, 0.002 ether);
+
+        vm.prank(alice);
+        vm.expectRevert("Above maximum bet");
+        market.betHigher{value: 0.01 ether}();
+
+        // But small bets work
+        vm.prank(alice);
+        market.betHigher{value: 0.001 ether}();
+        assertEq(market.higherPool(), 0.001 ether);
+    }
+
+    function test_SafeModeOff() public {
+        // Safe mode is already off (setUp disables it)
+        assertFalse(market.safeMode());
+        assertEq(market.maxBet(), 0);
+
+        // Large bets work
+        vm.prank(alice);
+        market.betHigher{value: 5 ether}();
+        assertEq(market.higherPool(), 5 ether);
+    }
+
+    function test_SetSafeMode() public {
+        market.setSafeMode(true, 0.005 ether);
+        assertTrue(market.safeMode());
+        assertEq(market.maxBet(), 0.005 ether);
+
+        // Turn off — maxBet goes to 0 (no limit)
+        market.setSafeMode(false, 0);
+        assertFalse(market.safeMode());
+        assertEq(market.maxBet(), 0);
     }
 
     // ============ Reentrancy Test ============
 
     function test_ReentrancyProtection() public {
-        // This test verifies the nonReentrant modifier exists
-        // A full reentrancy test would require a malicious contract
-        // but we verify the modifier is applied by checking the contract compiles
-        // and settle has the nonReentrant modifier
         assertTrue(true);
     }
 }
